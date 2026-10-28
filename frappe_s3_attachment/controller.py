@@ -150,7 +150,7 @@ def _ascii(value):
 
 
 def _file_url(key, file_name):
-    return f"{GENERATE_FILE}?key={key}&file_name={frappe.utils.quote(file_name or '')}"
+    return f"{GENERATE_FILE}?key={frappe.utils.quote(key, safe='/')}&file_name={frappe.utils.quote(file_name or '')}"
 
 
 def file_upload_to_s3(doc, method):
