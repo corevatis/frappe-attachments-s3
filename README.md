@@ -32,6 +32,11 @@ S3-kompatible Server (RustFS, MinIO, Ceph RGW):
     `s3_guest_download_rate_limit` (Standard 60/min); private Dateien nie.
   - Angemeldete Benutzer: `is_private=0` = für jeden angemeldeten Benutzer lesbar,
     `is_private=1` nur mit Leserecht auf jeden File-Datensatz zum Schlüssel.
+  - Achtung PDF: wkhtmltopdf lädt Bilder per URL und ist nur bei Desk-Sessions
+    angemeldet (Cookie `sid`), nicht in Hintergrundjobs/Token-Anfragen. Bilder, die in
+    Druckformate/Briefköpfe eingebettet werden (Logo), daher nicht über S3 ablegen
+    (`ignore_s3_upload_for_doctype` um `Letter Head` ergänzen) oder
+    `s3_allow_guest_downloads: 1` setzen.
   - Tests: `python -m unittest frappe_s3_attachment.tests.test_security`
     (ohne Site; CI `.github/workflows/tests.yml`).
 - `pyproject.toml` mit `[project]`/flit (vorher lagen die Abhängigkeiten in
