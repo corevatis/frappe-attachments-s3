@@ -90,6 +90,12 @@ doctype_list_js = {
 # }
 
 doc_events = {
+    # Frappes attach_files_to_document kennt nur /files, /private/files und http(s);
+    # die generate_file-URLs dieser App verknüpft attach_s3_files_to_document.
+    "*": {
+        "on_update": "frappe_s3_attachment.controller.attach_s3_files_to_document",
+        "on_update_after_submit": "frappe_s3_attachment.controller.attach_s3_files_to_document",
+    },
     "File": {
         "after_insert": "frappe_s3_attachment.controller.file_upload_to_s3",
         "on_trash": "frappe_s3_attachment.controller.delete_from_cloud"

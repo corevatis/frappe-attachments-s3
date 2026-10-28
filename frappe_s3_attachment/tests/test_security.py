@@ -196,3 +196,69 @@ class TestGuestAccess(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAttachS3Files(unittest.TestCase):
+    """attach_s3_files_to_document: unverknüpfte S3-Datei des Benutzers wird beim
+    Speichern mit dem Dokument verknüpft (Frappe selbst überspringt generate_file-URLs)."""
+
+    URL = c.GENERATE_FILE + "?key=site/2026/10/28/File/AB12_scan.usdz&file_name=scan.usdz"
+
+    def _doc(self, value, doctype="Scan"):
+        meta = mock.Mock()
+        meta.get.return_value = [frappe._dict(fieldname="usdz", fieldtype="Attach")]
+        doc = frappe._dict(doctype=doctype, name="SCN-1", usdz=value)
+        doc.meta = meta
+        return doc
+
+    def _run(self, doc, exists, user="meister@example.com"):
+        db = mock.Mock()
+        db.exists.side_effect = exists
+        with mock.patch.object(frappe, "db", db), mock.patch.object(c, "_session_user", return_value=user):
+            c.attach_s3_files_to_document(doc, "on_update")
+        return db
+
+    def test_unattached_own_file_is_attached(self):
+        db = self._run(self._doc(self.URL), [None, "F1"])
+        unattached_filter = db.exists.call_args_list[1].args[1]
+        self.assertEqual(unattached_filter["owner"], "meister@example.com")
+        self.assertIsNone(unattached_filter["attached_to_name"])
+        db.set_value.assert_called_once_with(
+            "File",
+            "F1",
+            {"attached_to_doctype": "Scan", "attached_to_name": "SCN-1", "attached_to_field": "usdz"},
+        )
+
+    def test_already_attached_untouched(self):
+        db = self._run(self._doc(self.URL), ["F1"])
+        self.assertEqual(db.exists.call_count, 1)
+        db.set_value.assert_not_called()
+
+    def test_foreign_or_attached_elsewhere_untouched(self):
+        # kein unverknüpfter Datensatz des Benutzers (fremd oder schon woanders verknüpft)
+        db = self._run(self._doc(self.URL), [None, None])
+        db.set_value.assert_not_called()
+
+    def test_other_urls_left_to_frappe(self):
+        for value in ("/private/files/scan.usdz", "/files/a.png", "https://example.com/a.png", None, ""):
+            db = self._run(self._doc(value), [])
+            db.exists.assert_not_called()
+            db.set_value.assert_not_called()
+
+    def test_file_doctype_skipped(self):
+        db = self._run(self._doc(self.URL, doctype="File"), [])
+        db.exists.assert_not_called()
+
+    def test_errors_do_not_break_save(self):
+        db = mock.Mock()
+        db.exists.side_effect = RuntimeError("db weg")
+        with mock.patch.object(frappe, "db", db), mock.patch.object(frappe, "log_error") as log:
+            c.attach_s3_files_to_document(self._doc(self.URL), "on_update")
+        log.assert_called_once()
+
+    def test_hooks_registered(self):
+        from frappe_s3_attachment import hooks
+
+        target = "frappe_s3_attachment.controller.attach_s3_files_to_document"
+        self.assertEqual(hooks.doc_events["*"]["on_update"], target)
+        self.assertEqual(hooks.doc_events["*"]["on_update_after_submit"], target)
