@@ -260,6 +260,66 @@ def file_upload_to_s3(doc, method):
             frappe.db.set_value(parent_doctype, doc.attached_to_name, image_field, file_url)
 
 
+def attach_s3_files_to_document(doc, method=None):
+    """Gegenstück zu ``frappe.core.doctype.file.utils.attach_files_to_document``
+    (on_update aller Dokumente) für die URLs dieser App.
+
+    Frappe verknüpft beim Speichern eine Datei aus einem Attach-Feld mit dem
+    Dokument, wenn sie noch an nichts hängt und vom angemeldeten Benutzer
+    hochgeladen wurde - aber nur für URLs, die mit ``/files``, ``/private/files``
+    oder ``http(s)://`` beginnen. Nach dem Upload nach S3 lautet die URL
+    ``/api/method/frappe_s3_attachment.controller.generate_file?...``: Frappe
+    überspringt sie, die Datei bleibt unverknüpft und ist (privat) nur für den
+    Hochladenden und System Manager lesbar, nicht für andere Benutzer mit
+    Leserecht auf das Dokument (Upload per REST ohne doctype/docname, z. B.
+    Mobile-App, oder Anhang in einem noch nicht gespeicherten Formular).
+
+    Wie im Original: nur unverknüpfte Dateien des angemeldeten Benutzers, keine
+    Übernahme fremder Dateien, Fehler brechen das Speichern nicht ab. Anders als
+    im Original wird kein neuer File-Datensatz angelegt und ``is_private`` nicht
+    aus der URL abgeleitet (die S3-URL sagt darüber nichts aus).
+    """
+    if doc.doctype == "File":
+        return
+    for df in doc.meta.get("fields", {"fieldtype": ["in", ["Attach", "Attach Image"]]}):
+        value = doc.get(df.fieldname)
+        if not (value or "").startswith(GENERATE_FILE):
+            continue
+        try:
+            if frappe.db.exists(
+                "File",
+                {
+                    "file_url": value,
+                    "attached_to_doctype": doc.doctype,
+                    "attached_to_name": doc.name,
+                    "attached_to_field": df.fieldname,
+                },
+            ):
+                continue
+            unattached = frappe.db.exists(
+                "File",
+                {
+                    "file_url": value,
+                    "attached_to_doctype": None,
+                    "attached_to_name": None,
+                    "attached_to_field": None,
+                    "owner": _session_user(),
+                },
+            )
+            if unattached:
+                frappe.db.set_value(
+                    "File",
+                    unattached,
+                    {
+                        "attached_to_doctype": doc.doctype,
+                        "attached_to_name": doc.name,
+                        "attached_to_field": df.fieldname,
+                    },
+                )
+        except Exception:
+            frappe.log_error(title="frappe_s3_attachment: Anhang nicht verknüpft")
+
+
 def _file_rows_for_key(key):
     """Alle File-Datensätze zu einem S3-Schlüssel (eigenes Feld; Altbestand
     der upstream-Version: Schlüssel in content_hash)."""
