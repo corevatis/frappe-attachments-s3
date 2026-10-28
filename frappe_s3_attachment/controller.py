@@ -30,8 +30,46 @@ import boto3
 import frappe
 from botocore.client import Config
 from botocore.exceptions import ClientError
+from werkzeug.wrappers import Response
 
 GENERATE_FILE = "/api/method/frappe_s3_attachment.controller.generate_file"
+
+# Nur diese Typen werden inline (im Browser) angezeigt; alles andere – auch
+# HTML und SVG – kommt als Attachment mit application/octet-stream, damit kein
+# hochgeladener Inhalt auf dem Site-Origin ausgeführt wird (Stored XSS).
+INLINE_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".pdf": "application/pdf",
+}
+
+
+def ensure_custom_fields():
+    """Feld File.s3_key (after_install/after_migrate): der S3-Schlüssel steht
+    in einem eigenen, schreibgeschützten Feld statt in content_hash."""
+    from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+    create_custom_fields(
+        {
+            "File": [
+                {
+                    "fieldname": "s3_key",
+                    "label": "S3 Key",
+                    "fieldtype": "Data",
+                    "length": 512,
+                    "read_only": 1,
+                    "hidden": 1,
+                    "permlevel": 1,
+                    "search_index": 1,
+                    "insert_after": "content_hash",
+                }
+            ]
+        },
+        update=True,
+    )
 
 
 def _settings():
@@ -175,11 +213,11 @@ def file_upload_to_s3(doc, method):
     file_url = _file_url(key, doc.file_name)
     os.remove(file_path)
     frappe.db.sql(
-        """UPDATE `tabFile` SET file_url=%s, folder=%s, old_parent=%s, content_hash=%s WHERE name=%s""",
+        """UPDATE `tabFile` SET file_url=%s, folder=%s, old_parent=%s, s3_key=%s WHERE name=%s""",
         (file_url, "Home/Attachments", "Home/Attachments", key, doc.name),
     )
     doc.file_url = file_url
-    doc.content_hash = key
+    doc.s3_key = key
 
     if parent_doctype and doc.attached_to_name and frappe.get_meta(parent_doctype).get("image_field"):
         image_field = frappe.get_meta(parent_doctype).get("image_field")
@@ -187,19 +225,57 @@ def file_upload_to_s3(doc, method):
             frappe.db.set_value(parent_doctype, doc.attached_to_name, image_field, file_url)
 
 
+def _file_rows_for_key(key):
+    """Alle File-Datensätze zu einem S3-Schlüssel (eigenes Feld; Altbestand
+    der upstream-Version: Schlüssel in content_hash)."""
+    fields = ["name", "is_private", "file_name"]
+    rows = frappe.get_all("File", filters={"s3_key": key, "file_url": ["like", GENERATE_FILE + "%"]}, fields=fields)
+    if not rows:
+        rows = frappe.get_all(
+            "File", filters={"content_hash": key, "file_url": ["like", GENERATE_FILE + "%"]}, fields=fields
+        )
+    return rows
+
+
+def check_read_access(key):
+    """Liefert den File-Datensatz, über den ausgeliefert wird, oder wirft
+    PermissionError. Abgelehnt wird, sobald IRGENDEIN Datensatz zu diesem
+    Schlüssel privat und für den aktuellen Nutzer nicht lesbar ist – ein
+    gefälschter oder kopierter Datensatz kann so nie Zugriff verschaffen,
+    höchstens verweigern."""
+    rows = _file_rows_for_key(key)
+    if not rows:
+        raise frappe.PermissionError
+    docs = [frappe.get_doc("File", r.name) for r in rows]
+    for d in docs:
+        if d.is_private and not d.has_permission("read"):
+            raise frappe.PermissionError
+    return docs[0]
+
+
+def build_download_response(file_name, body):
+    """Response mit sicheren Headern: Content-Type serverseitig aus der
+    Dateiendung (Allowlist), sonst Attachment + octet-stream."""
+    ext = os.path.splitext(file_name or "")[1].lower()
+    inline_type = INLINE_TYPES.get(ext)
+    response = Response(body)
+    response.mimetype = inline_type or "application/octet-stream"
+    response.headers.add(
+        "Content-Disposition", "inline" if inline_type else "attachment", filename=file_name or "file"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Content-Security-Policy"] = "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'"
+    response.headers["Cache-Control"] = "private, max-age=0, no-store"
+    return response
+
+
 @frappe.whitelist(allow_guest=True)
 def generate_file(key=None, file_name=None):
-    """Liefert eine S3-Datei aus — nur mit Leserecht auf den File-Datensatz
-    (öffentliche Dateien ohne Login, private nach Frappe-Rechten)."""
+    """Liefert eine S3-Datei aus. Öffentliche Dateien ohne Login, private nur
+    mit Leserecht auf jeden File-Datensatz zu diesem Schlüssel."""
     if not key:
-        frappe.throw(frappe._("Key not found."), frappe.DoesNotExistError)
-
-    file_name_db = frappe.db.get_value("File", {"content_hash": key}, "name")
-    if not file_name_db:
-        raise frappe.PermissionError
-    file_doc = frappe.get_doc("File", file_name_db)
-    if file_doc.is_private and not file_doc.has_permission("read"):
-        raise frappe.PermissionError
+        raise frappe.DoesNotExistError
+    file_doc = check_read_access(key)
 
     s3_upload = S3Operations()
     if not frappe.utils.cint(s3_upload.s3_settings_doc.stream_downloads):
@@ -211,11 +287,7 @@ def generate_file(key=None, file_name=None):
         obj = s3_upload.read_file_from_s3(key)
     except ClientError:
         raise frappe.DoesNotExistError
-    frappe.local.response["type"] = "download"
-    frappe.local.response["filename"] = file_doc.file_name
-    frappe.local.response["filecontent"] = obj["Body"].read()
-    frappe.local.response["content_type"] = obj.get("ContentType")
-    frappe.local.response["display_content_as"] = "inline"
+    return build_download_response(file_doc.file_name, obj["Body"].read())
 
 
 def upload_existing_files_s3(name):
@@ -239,8 +311,12 @@ def migrate_existing_files():
 
 
 def delete_from_cloud(doc, method):
-    if doc.file_url and doc.file_url.startswith(GENERATE_FILE) and is_configured():
-        S3Operations().delete_from_s3(doc.content_hash)
+    if not (doc.file_url and doc.file_url.startswith(GENERATE_FILE) and is_configured()):
+        return
+    key = doc.get("s3_key") or doc.content_hash
+    others = [r for r in _file_rows_for_key(key) if r.name != doc.name]
+    if key and not others:
+        S3Operations().delete_from_s3(key)
 
 
 @frappe.whitelist()

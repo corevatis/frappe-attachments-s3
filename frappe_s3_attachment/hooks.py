@@ -129,3 +129,7 @@ doc_events = {
 # 	"frappe.desk.doctype.event.event.get_events": "frappe_s3_attachment.event.get_events"
 # }
 
+
+# corevatis-v16: Feld File.s3_key anlegen
+after_install = "frappe_s3_attachment.controller.ensure_custom_fields"
+after_migrate = ["frappe_s3_attachment.controller.ensure_custom_fields"]
