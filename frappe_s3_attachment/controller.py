@@ -17,6 +17,20 @@ site_config-Schlüssel:
     s3_delete_from_cloud                      1 = beim Löschen in Frappe auch in S3
                                               löschen (bei Versionierung: Delete-Marker)
     ignore_s3_upload_for_doctype              Liste, Standard ["Data Import"]
+    s3_allow_guest_downloads                  1 = öffentliche Dateien (is_private=0) auch
+                                              ohne Login ausliefern; Standard 0 = Download
+                                              nur für angemeldete Benutzer (Session/Token)
+    s3_guest_download_rate_limit              Gäste-Downloads je IP und Minute, Standard 60
+    s3_inline_max_bytes                       größere Dateien kommen immer als Attachment,
+                                              Standard 20 MiB
+    s3_connect_timeout / s3_read_timeout      boto-Timeouts in Sekunden, Standard 5 / 30
+
+Download (``generate_file``): das S3-Objekt wird in Blöcken (``STREAM_CHUNK_SIZE``) zum
+Client gestreamt, nie komplett in den Worker geladen; ``Content-Length`` kommt aus dem
+Objekt. Gäste bekommen ohne ``s3_allow_guest_downloads`` immer 403 - auch für öffentliche
+Dateien; mit dem Schalter nur öffentliche Dateien, mit Rate-Limit je IP. Für angemeldete
+Benutzer gilt: öffentliche Datei = für jeden angemeldeten Benutzer lesbar, private Datei
+nur mit Leserecht auf jeden File-Datensatz zum Schlüssel.
 """
 
 import datetime
@@ -30,6 +44,7 @@ import boto3
 import frappe
 from botocore.client import Config
 from botocore.exceptions import ClientError
+from frappe.rate_limiter import rate_limit
 from werkzeug.wrappers import Response
 
 GENERATE_FILE = "/api/method/frappe_s3_attachment.controller.generate_file"
@@ -45,6 +60,19 @@ INLINE_TYPES = {
     ".webp": "image/webp",
     ".pdf": "application/pdf",
 }
+
+
+STREAM_CHUNK_SIZE = 64 * 1024
+INLINE_MAX_BYTES = 20 * 1024 * 1024
+GUEST_RATE_LIMIT = 60
+
+
+def _conf():
+    return frappe.local.conf
+
+
+def _session_user():
+    return frappe.session.user
 
 
 def ensure_custom_fields():
@@ -112,7 +140,13 @@ class S3Operations:
         kwargs = dict(
             region_name=self.s3_settings_doc.region_name,
             # Pfad-Adressierung: S3-kompatible Server ohne Wildcard-DNS je Bucket
-            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+            config=Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+                connect_timeout=frappe.utils.cint(_conf().get("s3_connect_timeout")) or 5,
+                read_timeout=frappe.utils.cint(_conf().get("s3_read_timeout")) or 30,
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
         )
         if self.s3_settings_doc.endpoint_url:
             kwargs["endpoint_url"] = self.s3_settings_doc.endpoint_url
@@ -149,7 +183,8 @@ class S3Operations:
 
     def upload_files_to_s3_with_key(self, file_path, file_name, is_private, parent_doctype, parent_name):
         """Lädt eine Datei hoch. Objekte sind immer privat (kein public-read-ACL);
-        öffentliche Frappe-Dateien liefert generate_file ohne Login aus."""
+        öffentliche Frappe-Dateien liefert generate_file angemeldeten Benutzern (Gästen nur
+        mit s3_allow_guest_downloads) aus."""
         content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
         key = self.key_generator(file_name, parent_doctype, parent_name)
         try:
@@ -253,12 +288,24 @@ def check_read_access(key):
     return docs[0]
 
 
-def build_download_response(file_name, body):
+def _inline_max_bytes():
+    value = _conf().get("s3_inline_max_bytes")
+    return INLINE_MAX_BYTES if value in (None, "") else frappe.utils.cint(value)
+
+
+def build_download_response(file_name, body, content_length=None):
     """Response mit sicheren Headern: Content-Type serverseitig aus der
-    Dateiendung (Allowlist), sonst Attachment + octet-stream."""
+    Dateiendung (Allowlist), sonst Attachment + octet-stream. Dateien über
+    ``s3_inline_max_bytes`` kommen immer als Attachment. ``body``: Bytes oder
+    Iterator von Blöcken (Streaming)."""
     ext = os.path.splitext(file_name or "")[1].lower()
     inline_type = INLINE_TYPES.get(ext)
-    response = Response(body)
+    if inline_type and content_length is not None and content_length > _inline_max_bytes():
+        inline_type = None
+    streamed = not isinstance(body, bytes | bytearray | str)
+    response = Response(body, direct_passthrough=streamed)
+    if content_length is not None:
+        response.content_length = content_length
     response.mimetype = inline_type or "application/octet-stream"
     response.headers.add(
         "Content-Disposition", "inline" if inline_type else "attachment", filename=file_name or "file"
@@ -269,10 +316,42 @@ def build_download_response(file_name, body):
     return response
 
 
+def stream_body(body, chunk_size=STREAM_CHUNK_SIZE):
+    """Blöcke aus dem botocore-StreamingBody; schließt die Verbindung am Ende
+    (auch bei Abbruch durch den Client)."""
+    try:
+        yield from body.iter_chunks(chunk_size=chunk_size)
+    finally:
+        body.close()
+
+
+@rate_limit(
+    limit=lambda: frappe.utils.cint(_conf().get("s3_guest_download_rate_limit")) or GUEST_RATE_LIMIT,
+    seconds=60,
+    ip_based=True,
+    endpoint="frappe_s3_attachment.controller.generate_file:guest",
+)
+def _count_guest_download():
+    return None
+
+
+def check_guest_access():
+    """Gäste nur, wenn ``s3_allow_guest_downloads`` gesetzt ist (dann mit Rate-Limit je IP)."""
+    if _session_user() not in (None, "", "Guest"):
+        return
+    if not frappe.utils.cint(_conf().get("s3_allow_guest_downloads")):
+        raise frappe.PermissionError
+    _count_guest_download()
+
+
+# allow_guest, damit öffentliche Dateien per Schalter erreichbar sein können; ohne
+# Schalter weist check_guest_access jeden Gast ab (vor jedem DB-/S3-Zugriff).
 @frappe.whitelist(allow_guest=True)
 def generate_file(key=None, file_name=None):
-    """Liefert eine S3-Datei aus. Öffentliche Dateien ohne Login, private nur
-    mit Leserecht auf jeden File-Datensatz zu diesem Schlüssel."""
+    """Liefert eine S3-Datei aus (gestreamt). Private Dateien nur mit Leserecht auf
+    jeden File-Datensatz zu diesem Schlüssel; öffentliche für angemeldete Benutzer,
+    für Gäste nur mit ``s3_allow_guest_downloads``."""
+    check_guest_access()
     if not key:
         raise frappe.DoesNotExistError
     file_doc = check_read_access(key)
@@ -287,7 +366,10 @@ def generate_file(key=None, file_name=None):
         obj = s3_upload.read_file_from_s3(key)
     except ClientError:
         raise frappe.DoesNotExistError
-    return build_download_response(file_doc.file_name, obj["Body"].read())
+    length = obj.get("ContentLength")
+    return build_download_response(
+        file_doc.file_name, stream_body(obj["Body"]), None if length is None else int(length)
+    )
 
 
 def upload_existing_files_s3(name):

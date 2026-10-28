@@ -16,10 +16,29 @@ S3-kompatible Server (RustFS, MinIO, Ceph RGW):
   `s3_delete_from_cloud`, `ignore_s3_upload_for_doctype`.
 - `endpoint_url` und Pfad-Adressierung für boto3.
 - Alle Objekte privat (kein `public-read`-ACL); Auslieferung über
-  `generate_file` mit Rechteprüfung am File-Datensatz (öffentliche Dateien
-  ohne Login, private nach Frappe-Rechten). Standard: Streaming über die Site
-  statt Redirect auf eine Presigned URL — der Objektspeicher muss dann nicht
-  öffentlich erreichbar sein.
+  `generate_file` mit Rechteprüfung am File-Datensatz. Standard: Streaming über
+  die Site statt Redirect auf eine Presigned URL — der Objektspeicher muss dann
+  nicht öffentlich erreichbar sein.
+- Download (Review Epic 0, F-2):
+  - **Streaming**: das Objekt geht in 64-KiB-Blöcken an den Client
+    (`iter_chunks`, `direct_passthrough`), `Content-Length` aus dem Objekt; nichts
+    wird komplett in den Worker geladen. boto-Timeouts `s3_connect_timeout` (5 s)
+    und `s3_read_timeout` (30 s), 3 Versuche.
+  - **Inline nur bis `s3_inline_max_bytes`** (Standard 20 MiB, nur JPEG/PNG/GIF/WebP/PDF);
+    größere Dateien kommen als Attachment.
+  - **Gäste**: ohne Anmeldung (Session oder Token) immer 403 – auch für
+    öffentliche Dateien (`is_private=0`). Mit `s3_allow_guest_downloads: 1` liefert
+    der Endpunkt Gästen öffentliche Dateien aus, Rate-Limit je IP
+    `s3_guest_download_rate_limit` (Standard 60/min); private Dateien nie.
+  - Angemeldete Benutzer: `is_private=0` = für jeden angemeldeten Benutzer lesbar,
+    `is_private=1` nur mit Leserecht auf jeden File-Datensatz zum Schlüssel.
+  - Achtung PDF: wkhtmltopdf lädt Bilder per URL und ist nur bei Desk-Sessions
+    angemeldet (Cookie `sid`), nicht in Hintergrundjobs/Token-Anfragen. Bilder, die in
+    Druckformate/Briefköpfe eingebettet werden (Logo), daher nicht über S3 ablegen
+    (`ignore_s3_upload_for_doctype` um `Letter Head` ergänzen) oder
+    `s3_allow_guest_downloads: 1` setzen.
+  - Tests: `python -m unittest frappe_s3_attachment.tests.test_security`
+    (ohne Site; CI `.github/workflows/tests.yml`).
 - `pyproject.toml` mit `[project]`/flit (vorher lagen die Abhängigkeiten in
   `[tool.bench.frappe-dependencies]`, boto3 wurde nie installiert);
   `python-magic`-, `urllib3<2`- und `six`-Pins entfernt (MIME-Typ über

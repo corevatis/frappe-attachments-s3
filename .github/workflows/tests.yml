@@ -1,0 +1,35 @@
+name: Tests (ohne Site)
+
+on:
+  push:
+    branches: [corevatis-v16]
+  pull_request:
+    branches: [corevatis-v16]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FRAPPE_BRANCH: version-16
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Frappe ${{ env.FRAPPE_BRANCH }} (nur Python-Abhängigkeiten, ohne Datenbanktreiber)
+        run: |
+          git clone --depth 1 --branch "${FRAPPE_BRANCH}" https://github.com/frappe/frappe "$RUNNER_TEMP/frappe"
+          python - "$RUNNER_TEMP/frappe/pyproject.toml" > "$RUNNER_TEMP/frappe-reqs.txt" <<'PY'
+          import sys, tomllib
+          deps = tomllib.load(open(sys.argv[1], "rb"))["project"]["dependencies"]
+          print("\n".join(d for d in deps if not d.lower().startswith(("mysqlclient", "pycups"))))
+          PY
+          pip install -r "$RUNNER_TEMP/frappe-reqs.txt" "boto3>=1.34.0"
+      - name: python -m unittest
+        run: PYTHONPATH="$RUNNER_TEMP/frappe" python -m unittest -v frappe_s3_attachment.tests.test_security
